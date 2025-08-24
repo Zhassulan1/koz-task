@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+Simple service manager for ML pipeline with Docker Compose, model servers, and fine-tuning
+"""
+
+import os
+import sys
+import logging
+import json
+import time
+import signal
+import subprocess
+from typing import Dict, Any
+import argparse
+import requests
+from opencode import init_project, generate_module
+
+
+# State file to persist service information
+STATE_FILE = ".service_state.json"
+COMPOSE_DIR = "n8n-compose"
+COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+
+
+class ServiceState:
+    """Manages persistent service state"""
+    
+    def __init__(self):
+        self.state = self.load_state()
+    
+    def load_state(self) -> Dict[str, Any]:
+        """Load state from file"""
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading state: {e}")
+        return {
+            "docker_running": False,
+            "model_provider": None,  # "own" or "ollama"
+            "model_name": None,
+            "model_path": None,
+            "server_host": "localhost",
+            "server_port": None,
+            "server_process": None,
+            "ollama_model": None
+        }
+    
+    def save_state(self):
+        """Save current state to file"""
+        try:
+            with open(STATE_FILE, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            print(f"Error saving state: {e}")
+    
+    def update(self, **kwargs):
+        """Update state with new values"""
+        self.state.update(kwargs)
+        self.save_state()
+    
+    def get(self, key: str, default=None):
+        """Get state value"""
+        return self.state.get(key, default)
+    
+    def clear_model_state(self):
+        """Clear model-related state"""
+        self.update(
+            model_provider=None,
+            model_name=None,
+            model_path=None,
+            server_port=None,
+            server_process=None,
+            ollama_model=None
+        )
+
+class ServiceManager:
+    """Main service manager"""
+    
+    def __init__(self):
+        self.state = ServiceState()
+    
+    def run_command(self, cmd: list, cwd: str = None, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a command and return the result"""
+        try:
+            result = subprocess.run(cmd, cwd=cwd, check=check, 
+                                  capture_output=True, text=True)
+            return result
+        except subprocess.CalledProcessError as e:
+            if check:
+                print(f"Command failed: {' '.join(cmd)}")
+                print(f"Error: {e.stderr}")
+                raise
+            return e
+    
+    def is_port_in_use(self, port: int) -> bool:
+        """Check if a port is in use"""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('localhost', port))
+                return False
+            except socket.error:
+                return True
+    
+    def wait_for_server(self, host: str, port: int, timeout: int = 60) -> bool:
+        """Wait for server to be ready"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get(f"http://{host}:{port}/health", timeout=5)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(1)
+        return False
+    
+    def up(self):
+        """Start docker compose services"""
+        print("Starting Docker Compose services...")
+        
+        if not os.path.exists(COMPOSE_FILE):
+            print(f"Error: Docker compose file not found: {COMPOSE_FILE}")
+            return False
+        
+        try:
+            result = self.run_command(["docker-compose", "up", "-d"], cwd=COMPOSE_DIR)
+            print("Docker Compose services started successfully!")
+            self.state.update(docker_running=True)
+            return True
+        except subprocess.CalledProcessError:
+            print("Failed to start Docker Compose services")
+            return False
+    
+    def down(self):
+        """Stop all services"""
+        print("Stopping all services...")
+        
+        # Stop model server if running
+        self.model_detach()
+        
+        # Stop docker compose
+        if os.path.exists(COMPOSE_FILE):
+            try:
+                result = self.run_command(["docker-compose", "down"], cwd=COMPOSE_DIR)
+                print("Docker Compose services stopped")
+            except subprocess.CalledProcessError:
+                print("Warning: Failed to stop Docker Compose services")
+        
+        self.state.update(docker_running=False)
+        print("All services stopped")
+    
+    def model_attach(self):
+        """Attach a model server"""
+        print("Choose model provider:")
+        print("1 - Own LLM server")
+        print("2 - Ollama server (default)")
+        
+        while True:
+            choice = input("Enter choice (1 or 2): ").strip()
+            if choice in ["1", "2", "", None]:
+                break
+            print("Invalid choice. Please enter 1 or 2.")
+        
+        if choice == "1":
+            return self._attach_own_server()
+        else:
+            return self._attach_ollama()
+    
+    def _attach_own_server(self):
+        """Attach own LLM server"""
+        model_path = input("Enter path to model: ").strip()
+        if not os.path.exists(model_path):
+            print(f"Error: Model path not found: {model_path}")
+            return False
+        
+        # Get server configuration
+        while True:
+            try:
+                port = int(input("Enter port to run server (default 8000): ").strip() or "8000")
+                if self.is_port_in_use(port):
+                    print(f"Port {port} is already in use. Please choose another port.")
+                    continue
+                break
+            except ValueError:
+                print("Please enter a valid port number.")
+        
+        use_4bit = input("Use 4-bit quantization? (y/N): ").strip().lower() in ['y', 'yes']
+        model_name = input("Enter model name (default: custom-model): ").strip() or "custom-model"
+        
+        # Start the server as a separate process
+        print(f"Starting LLM server on port {port}...")
+        
+        try:
+            # Start server as subprocess
+            server_cmd = [
+                sys.executable, "llm_server.py",
+                model_path,
+                "--model-name", model_name,
+                "--port", str(port),
+                "--host", "0.0.0.0"
+            ]
+            
+            if not use_4bit:
+                server_cmd.append("--no-4bit")
+            
+            # Start server process in background
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            server_process = subprocess.Popen(
+                server_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=script_dir
+            )
+            
+            # Wait for server to be ready
+            if self.wait_for_server("localhost", port):
+                print(f"LLM server started successfully on port {port}")
+                self.state.update(
+                    model_provider="own",
+                    model_name=model_name,
+                    model_path=model_path,
+                    server_port=port,
+                    server_host="localhost",
+                    server_process=server_process.pid
+                )
+                return True
+            else:
+                print("Failed to start LLM server")
+                # Kill the process if it didn't start properly
+                if os.name != 'nt':
+                    os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
+                else:
+                    server_process.terminate()
+
+                return False
+                
+        except Exception as e:
+            print(f"Error starting LLM server: {e}")
+            return False
+    
+    def _attach_ollama(self):
+        """Attach Ollama server"""
+        model_name = input("Enter Ollama model name (default: qwen2.5-coder:7b): ").strip()
+        if not model_name:
+            model_name = r"qwen2.5-coder:7b"
+            # print("Model name cannot be empty")
+            # return False
+        
+        print(f"Starting Ollama with model {model_name}...")
+        
+        try:
+            # Run ollama in background
+            result = self.run_command(["ollama", "run", model_name], check=False)
+            
+            # Wait a bit for ollama to start
+            time.sleep(5)
+            
+            # Test if ollama is responding
+            try:
+                response = requests.get("http://localhost:11434/api/tags", timeout=10)
+                if response.status_code == 200:
+                    print(f"Ollama started successfully with model {model_name}")
+                    self.state.update(
+                        model_provider="ollama",
+                        ollama_model=model_name,
+                        server_host="localhost",
+                        server_port=11434
+                    )
+                    return True
+            except requests.RequestException:
+                pass
+            
+            print("Failed to start Ollama or model not available")
+            return False
+            
+        except Exception as e:
+            print(f"Error starting Ollama: {e}")
+            return False
+    
+    def model_detach(self, provider: str = None):
+        """Detach current model server"""
+
+        if provider is None:
+            provider = self.state.get("model_provider")
+        
+        if not provider:
+            print("No model currently attached")
+            return True
+        
+        print(f"Detaching {provider} model server...")
+        
+        if provider == "own":
+            # Stop own server via API
+            port = self.state.get("server_port")
+            if port:
+                try:
+                    requests.get(f"http://localhost:{port}/api/shutdown", timeout=5)
+                    print("Own LLM server stopped")
+                except requests.RequestException:
+                    print("Warning: Could not gracefully stop LLM server")
+        
+        elif provider == "ollama":
+            # Stop ollama model
+            model_name = self.state.get("ollama_model")
+            if model_name:
+                try:
+                    self.run_command(["ollama", "stop", model_name], check=False)
+                    print(f"Ollama model {model_name} stopped")
+                except Exception:
+                    print("Warning: Could not stop Ollama model")
+        
+        # Clear model state
+        self.state.clear_model_state()
+        return True
+    
+    def finetune(self, codebase_path: str):
+        """Fine-tune a model on given codebase"""
+        if not os.path.exists(codebase_path):
+            print(f"Error: Codebase path not found: {codebase_path}")
+            return False
+        
+        # Check if model is attached
+        if not self.state.get("model_provider"):
+            print("Error: No model attached. Please attach a model first with 'model attach'")
+            return False
+        
+        print("Fine-tuning configuration:")
+        
+        # Get fine-tuning parameters
+        model_path = input("Enter path to model to fine-tune: ").strip()
+        if not os.path.exists(model_path):
+            print(f"Error: Model path not found: {model_path}")
+            return False
+        
+        output_dir = input("Enter output directory (default: ./models/finetuned): ").strip() or "./models/finetuned"
+        
+        try:
+            epochs = int(input("Enter number of epochs (default: 3): ").strip() or "3")
+            max_steps = int(input("Enter max steps (default: 60): ").strip() or "60")
+            warmup_steps = int(input("Enter warmup steps (default: 5): ").strip() or "5")
+            grad_accum_steps = int(input("Enter gradient accumulation steps (default: 4): ").strip() or "4")
+            learning_rate = float(input("Enter learning rate (default: 2e-4): ").strip() or "2e-4")
+            max_seq_length = int(input("Enter max sequence length (default: 2048): ").strip() or "2048")
+        except ValueError:
+            print("Invalid numeric input")
+            return False
+        
+        save_variants = input("Save model variants? (y/N): ").strip().lower() in ['y', 'yes']
+        export_gguf = input("Export to GGUF format? (y/N): ").strip().lower() in ['y', 'yes']
+        
+        max_examples = int(input("Enter max examples for dataset (default: 3000): ").strip() or "3000")
+        
+        try:
+            # Import required modules
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            from finetuner import generate_dataset, Qwen25FineTuner
+            
+            # Get current model server info
+            server_host = self.state.get("server_host", "localhost")
+            server_port = self.state.get("server_port", 11434)
+            model_name = self.state.get("model_name") or self.state.get("ollama_model", "")
+            
+            server_url = f"http://{server_host}:{server_port}"
+            
+            print(f"Generating dataset using model at {server_url}...")
+            
+            # Generate dataset
+            dataset_list = generate_dataset(
+                repo_path=codebase_path,
+                max_examples=max_examples,
+                llm_server=server_url,
+                llm_name=model_name
+            )
+            
+            if not dataset_list:
+                print("Failed to generate dataset")
+                return False
+            
+            print(f"Generated {len(dataset_list)} examples")
+            
+            # Detach model to free VRAM
+            print("Detaching model to free VRAM for fine-tuning...")
+            self.model_detach()
+            
+            # Wait a bit for cleanup
+            time.sleep(3)
+            
+            # Start fine-tuning
+            print("Starting fine-tuning process...")
+            
+            # Create output directory
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Initialize fine-tuner
+            fine_tuner = Qwen25FineTuner(
+                model_name=model_path,
+                max_seq_length=max_seq_length
+            )
+            
+            # Load model
+            fine_tuner.load_model()
+            
+            # Format dataset
+            dataset = fine_tuner.format_dataset(dataset_list)
+            
+            # Train the model
+            trainer_stats = fine_tuner.train(
+                dataset=dataset,
+                output_dir=output_dir,
+                num_train_epochs=epochs,
+                learning_rate=learning_rate,
+                gradient_accumulation_steps=grad_accum_steps,
+                max_steps=max_steps,
+                warmup_steps=warmup_steps,
+            )
+            
+            print("Fine-tuning completed successfully!")
+            
+            # Save model variants if requested
+            if save_variants:
+                fine_tuner.save_model_variants(output_dir)
+            
+            # Export to GGUF if requested
+            if export_gguf:
+                fine_tuner.export_to_gguf(output_dir)
+            
+            print(f"Fine-tuned model saved to: {output_dir}")
+            return True
+            
+        except Exception as e:
+            print(f"Error during fine-tuning: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def offline_verify(self):
+        """Verify network connectivity"""
+        print("Checking network connectivity...")
+        
+        test_sites = ["google.com", "github.com", "huggingface.co", "pypi.org"]
+        
+        for site in test_sites:
+            try:
+                result = self.run_command(["ping", "-c", "1", site], check=False)
+                if result.returncode == 0:
+                    print(f"✓ {site} - OK")
+                else:
+                    print(f"✗ {site} - Failed")
+            except Exception as e:
+                print(f"✗ {site} - Error: {e}")
+        
+        # Test HTTP connectivity
+        print("\nTesting HTTP connectivity...")
+        for site in ["http://google.com", "https://github.com", "https://huggingface.co"]:
+            try:
+                response = requests.get(site, timeout=10)
+                print(f"✓ {site} - HTTP {response.status_code}")
+            except requests.RequestException as e:
+                print(f"✗ {site} - Failed: {e}")
+    
+    def status(self):
+        """Show current service status"""
+        print("Service Status:")
+        print(f"  Docker Compose: {'Running' if self.state.get('docker_running') else 'Stopped'}")
+        
+        provider = self.state.get("model_provider")
+        if provider:
+            print(f"  Model Provider: {provider}")
+            if provider == "own":
+                print(f"    Model: {self.state.get('model_name')}")
+                print(f"    Path: {self.state.get('model_path')}")
+                print(f"    Port: {self.state.get('server_port')}")
+            elif provider == "ollama":
+                print(f"    Model: {self.state.get('ollama_model')}")
+                print(f"    Port: {self.state.get('server_port', 11434)}")
+        else:
+            print("  Model Provider: None")
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Set up logging configuration."""
+    level = logging.DEBUG if verbose else logging.INFO
+
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Set up console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    root_logger.addHandler(console_handler)
+
+    # Suppress verbose logs from external libraries
+    if not verbose:
+        logging.getLogger('transformers').setLevel(logging.WARNING)
+        logging.getLogger('datasets').setLevel(logging.WARNING)
+        logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+
+def main():
+
+    setup_logging(verbose=True)
+
+    parser = argparse.ArgumentParser(description="koz")
+    parser.add_argument("command", help="Command to execute")
+    parser.add_argument("args", nargs="*", help="Additional arguments")
+
+    args = parser.parse_args()
+
+    manager = ServiceManager()
+
+    if args.command == "up":
+        manager.up()
+    elif args.command == "down":
+        manager.down()
+    elif args.command == "model":
+        if not args.args:
+            print("Usage:model <attach|detach>")
+            return
+
+        if args.args[0] == "attach":
+            manager.model_attach()
+        elif args.args[0] == "detach":
+            manager.model_detach()
+        else:
+            print("Invalid model command. Use 'attach' or 'detach'")
+    elif args.command == "finetune":
+        if not args.args:
+            print("Usage:finetune <codebase_path>")
+            return
+        manager.finetune(args.args[0])
+    elif args.command == "offline_verify":
+        manager.offline_verify()
+    elif args.command == "status":
+        manager.status()
+    elif args.command == "init":
+        if len(args.args) < 2:
+            print("Usage: python koz init <project_name> <path>")
+            return
+        app_name = args.args[0]
+        path = args.args[1]
+        model_name = manager.state.get("ollama_model")
+        if manager.state.get("model_provider") == "ollama":
+            manager.model_detach("ollama")
+            time.sleep(5)
+        init_project(app_name, path, model_name)
+    elif args.command == "generate_module":
+        if not args.args:
+            print("Usage: generate_module <module_name>")
+            return
+        module_name = args.args[0]
+        model_name = manager.state.get("ollama_model")
+        if manager.state.get("model_provider") == "ollama":
+            manager.model_detach("ollama")
+            time.sleep(5)
+        generate_module(module_name, model_name)
+    
+    else:
+        print(f"Unknown command: {args.command}")
+        print("Available commands: up, down, model attach, model detach, finetune, offline_verify, status, init")
+
+
+if __name__ == "__main__":
+    main()
